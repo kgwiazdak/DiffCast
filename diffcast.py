@@ -388,11 +388,13 @@ class ContextNet(nn.Module):
         dim,    # must be same as Unet
         dim_mults=(1, 2, 4, 8),     # must be same as Unet
         channels = 1,
+        t_in = 5,
     ):
         super().__init__()
         self.channels = channels
         self.dim = dim
         self.dim_mults = dim_mults
+        self.t_in = t_in
         
         self.init_conv = nn.Conv2d(channels, dim, 7, padding = 3)
 
@@ -442,8 +444,10 @@ class ContextNet(nn.Module):
         
         for i in range(t):
             globla_ctx = self.forward(frames[:,i])
-            if i == 5:
+            if i == self.t_in - 1:
                 local_ctx = [h.clone() for h in globla_ctx]
+        if local_ctx is None:
+            local_ctx = [h.clone() for h in globla_ctx]
         return globla_ctx, local_ctx
         
         
@@ -791,6 +795,32 @@ class GaussianDiffusion(nn.Module):
         posterior_log_variance_clipped = extract(self.posterior_log_variance_clipped, t, x_t.shape)
         return posterior_mean, posterior_variance, posterior_log_variance_clipped
 
+    def q_sample(self, x_start, t, noise=None):
+        noise = default(noise, lambda: torch.randn_like(x_start))
+        return (
+            extract(self.sqrt_alphas_cumprod, t, x_start.shape) * x_start
+            + extract(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) * noise
+        )
+
+    def p_losses(self, x_start, t, cond=None, ctx=None, idx=None, noise=None):
+        noise = default(noise, lambda: torch.randn_like(x_start))
+        x = self.q_sample(x_start=x_start, t=t, noise=noise)
+        model_out = self.model(x, t, cond=cond, ctx=ctx, idx=idx)
+
+        if self.objective == 'pred_noise':
+            target = noise
+        elif self.objective == 'pred_x0':
+            target = x_start
+        elif self.objective == 'pred_v':
+            target = self.predict_v(x_start, t, noise)
+        else:
+            raise ValueError(f'unknown objective {self.objective}')
+
+        loss = F.mse_loss(model_out, target, reduction='none')
+        loss = reduce(loss, 'b ... -> b', 'mean')
+        loss = loss * extract(self.loss_weight, t, loss.shape)
+        return loss.mean()
+
     def model_predictions(self, x, t, cond=None, ctx=None, idx=None, clip_x_start = False, rederive_pred_noise = False):
         model_output = self.model(x, t, cond=cond, ctx=ctx, idx=idx)
         maybe_clip = partial(torch.clamp, min = -1., max = 1.) if clip_x_start else identity
@@ -817,7 +847,7 @@ class GaussianDiffusion(nn.Module):
         return ModelPrediction(pred_noise, x_start)
 
     def p_mean_variance(self, x, t, cond=None, ctx=None, idx=None, clip_denoised = True):
-        preds = self.model_predictions(x, t, cond=cond, ctx=cond, idx=cond,)
+        preds = self.model_predictions(x, t, cond=cond, ctx=ctx, idx=idx)
         x_start = preds.pred_x_start
 
         if clip_denoised:
@@ -944,13 +974,52 @@ class GaussianDiffusion(nn.Module):
         # print(ys.max(), ys.min(),ys.shape)
         backbone_output = self.unnormalize(backbone_output)
         return frames_pred, backbone_output, ys
+
+    def train_loss(self, frames_in, frames_gt):
+        B, T_in, c, h, w = frames_in.shape
+        T_out = frames_gt.shape[1]
+        if T_out % T_in != 0:
+            raise ValueError(f"T_out ({T_out}) must be divisible by T_in ({T_in})")
+
+        with torch.no_grad():
+            backbone_output, _ = self.backbone_net.predict(frames_in)
+
+        frames_in = self.normalize(frames_in)
+        frames_gt = self.normalize(frames_gt)
+        backbone_output = self.normalize(backbone_output)
+
+        global_ctx, local_ctx = self.ctx_net.scan_ctx(torch.cat((frames_in, backbone_output), dim=1))
+
+        losses = []
+        pre_frag = frames_in
+        pre_mu = None
+
+        for frag_idx in range(T_out // T_in):
+            mu = backbone_output[:, frag_idx * T_in : (frag_idx + 1) * T_in]
+            gt = frames_gt[:, frag_idx * T_in : (frag_idx + 1) * T_in]
+            residual = gt - mu
+
+            cond = pre_frag - pre_mu if pre_mu is not None else torch.zeros_like(pre_frag)
+            ctx = global_ctx if frag_idx > 0 else local_ctx
+            idx = torch.full((B,), frag_idx, device=frames_in.device, dtype=torch.long)
+            t = torch.randint(0, self.num_timesteps, (B,), device=frames_in.device).long()
+
+            losses.append(self.p_losses(residual, t, cond=cond, ctx=ctx, idx=idx))
+
+            pre_frag = gt
+            pre_mu = mu
+
+        return torch.stack(losses).mean()
     
 
-    def predict(self, frames_in,  compute_loss=False, **kwargs):
+    def predict(self, frames_in, frames_gt=None, compute_loss=False, **kwargs):
+        if compute_loss:
+            if frames_gt is None:
+                raise ValueError("frames_gt is required for diffusion training")
+            return None, self.train_loss(frames_in=frames_in, frames_gt=frames_gt)
+
         T_out = default(kwargs.get('T_out'), 20)
         pred, mu, y = self.sample(frames_in=frames_in, T_out=T_out)
-        if compute_loss:
-            raise NotImplementedError("We are sorry that we do not support training process for now because of business limitation ")
         return pred, None
 
 
@@ -977,6 +1046,7 @@ def get_model(
         dim = dim,
         dim_mults=dim_mults,
         channels=img_channels,
+        t_in=T_in,
     )
     
     diffusion = GaussianDiffusion(

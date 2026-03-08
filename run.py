@@ -1,5 +1,4 @@
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "2"
 import os.path as osp
 import math
 import time
@@ -34,7 +33,13 @@ def create_parser():
     # --------------- Basic ---------------
     parser = argparse.ArgumentParser()
     
-    parser.add_argument('--backbone', default='phydnet',  type=str,                 help='backbone model for deterministic prediction')
+    parser.add_argument(
+        '--backbone',
+        default='phydnet',
+        type=str,
+        choices=['simvp', 'phydnet', 'smaat'],
+        help='backbone model for deterministic prediction',
+    )
     parser.add_argument('--use_diff', action="store_true", default=False,        help='Weather use diff framework, as for ablation study')
     
     parser.add_argument("--seed",           type=int,   default=0,              help='Experiment seed')
@@ -247,6 +252,15 @@ class Runner(object):
                 "T_in": self.args.frames_in,
                 "T_out": self.args.frames_out,
                 "device": self.device
+            }
+            model = get_model(**kwargs)
+
+        elif self.args.backbone == 'smaat':
+            from models.smaat import get_model
+            kwargs = {
+                "in_shape": (self.args.img_channel, self.args.img_size, self.args.img_size),
+                "T_in": self.args.frames_in,
+                "T_out": self.args.frames_out,
             }
             model = get_model(**kwargs)
             
@@ -462,7 +476,12 @@ class Runner(object):
         radar_batch = self._get_seq_data(batch)
         frames_in, frames_out = radar_batch[:,:self.args.frames_in], radar_batch[:,self.args.frames_in:]
         assert radar_batch.shape[1] == self.args.frames_out + self.args.frames_in, "radar sequence length error"
-        _, loss = self.model.predict(frames_in=frames_in, frames_gt=frames_out, compute_loss=True)
+        _, loss = self.model.predict(
+            frames_in=frames_in,
+            frames_gt=frames_out,
+            compute_loss=True,
+            T_out=self.args.frames_out,
+        )
         if loss is None:
             raise ValueError("Loss is None, please check the model predict function")
         return {'total_loss': loss}
