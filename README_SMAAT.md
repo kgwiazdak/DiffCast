@@ -4,6 +4,7 @@ This folder contains upstream DiffCast with one minimal extension:
 - Added a new backbone option `--backbone smaat` in `run.py`.
 - Added `models/smaat/` implementing a DiffCast-compatible deterministic predictor (`predict(frames_in, frames_gt=None, compute_loss=False)`).
 - Added diffusion training support for `--use_diff` with the same `predict(..., compute_loss=True)` contract.
+- Temporal skip features are fused by a time-wise mean before decoding, so the backbone uses all observed frames instead of only the last one.
 
 ## What was intentionally changed
 - `diffcast.py`: only training-path additions and bug fixes needed for `--use_diff` training with backbone residual diffusion.
@@ -34,6 +35,9 @@ Run the local contract/smoke script before long training runs:
 ```bash
 python ../../scripts/diffcast_smaat_contract_check.py
 ```
+
+## Notes
+- The current DiffCast training path keeps `alpha=0.5`; with that fixed value, swapping the deterministic and diffusion weights does not change the scalar total loss, but it still matters if you later expose or tune `alpha`.
 
 ## Server Loop
 For reproducible baseline-vs-candidate runs with iteration audits, use:

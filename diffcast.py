@@ -925,10 +925,8 @@ class GaussianDiffusion(nn.Module):
     def sample(self, frames_in, T_out, return_all_timesteps = False):
         B, T_in, c, h, w = frames_in.shape
         device = self.device
-        backbone_output, _ = self.backbone_net.predict(frames_in)
-        
         frames_in = self.normalize(frames_in)
-        backbone_output = self.normalize(backbone_output)
+        backbone_output, _ = self.backbone_net.predict(frames_in)
         
         global_ctx, local_ctx = self.ctx_net.scan_ctx(torch.cat((frames_in, backbone_output), dim=1))
         
@@ -975,18 +973,17 @@ class GaussianDiffusion(nn.Module):
         backbone_output = self.unnormalize(backbone_output)
         return frames_pred, backbone_output, ys
 
-    def train_loss(self, frames_in, frames_gt):
+    def train_loss(self, frames_in, frames_gt, alpha=0.5):
         B, T_in, c, h, w = frames_in.shape
         T_out = frames_gt.shape[1]
         if T_out % T_in != 0:
             raise ValueError(f"T_out ({T_out}) must be divisible by T_in ({T_in})")
 
-        with torch.no_grad():
-            backbone_output, _ = self.backbone_net.predict(frames_in)
-
         frames_in = self.normalize(frames_in)
         frames_gt = self.normalize(frames_gt)
-        backbone_output = self.normalize(backbone_output)
+        backbone_output, det_loss = self.backbone_net.predict(
+            frames_in, frames_gt=frames_gt, compute_loss=True
+        )
 
         global_ctx, local_ctx = self.ctx_net.scan_ctx(torch.cat((frames_in, backbone_output), dim=1))
 
@@ -1009,14 +1006,17 @@ class GaussianDiffusion(nn.Module):
             pre_frag = gt
             pre_mu = mu
 
-        return torch.stack(losses).mean()
+        diff_loss = torch.stack(losses).mean()
+        total_loss = alpha * det_loss + (1 - alpha) * diff_loss
+        return total_loss, det_loss.detach(), diff_loss.detach()
     
 
     def predict(self, frames_in, frames_gt=None, compute_loss=False, **kwargs):
         if compute_loss:
             if frames_gt is None:
                 raise ValueError("frames_gt is required for diffusion training")
-            return None, self.train_loss(frames_in=frames_in, frames_gt=frames_gt)
+            total, det, diff = self.train_loss(frames_in=frames_in, frames_gt=frames_gt)
+            return None, (total, det, diff)
 
         T_out = default(kwargs.get('T_out'), 20)
         pred, mu, y = self.sample(frames_in=frames_in, T_out=T_out)

@@ -484,6 +484,9 @@ class Runner(object):
         )
         if loss is None:
             raise ValueError("Loss is None, please check the model predict function")
+        if isinstance(loss, tuple):
+            total_loss, det_loss, diff_loss = loss
+            return {'total_loss': total_loss, 'det_loss': det_loss, 'diff_loss': diff_loss}
         return {'total_loss': loss}
         
     
