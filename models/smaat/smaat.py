@@ -270,13 +270,6 @@ class SmaAtDecoder(nn.Module):
         return self.outc(x)
 
 
-def mean_skip_connections(skip_history):
-    """Average skip tensors over the input time dimension for each UNet scale."""
-    if not skip_history:
-        raise ValueError("skip_history must contain at least one set of skip connections")
-    return tuple(torch.stack(level_skips, dim=0).mean(dim=0) for level_skips in zip(*skip_history))
-
-
 class SmaAtUNetTemporal(nn.Module):
     """
     SmaAt-UNet with ConvLSTM bottleneck for multi-step nowcasting.
@@ -284,12 +277,13 @@ class SmaAtUNetTemporal(nn.Module):
     Encoding phase: each of T_in input frames is encoded by the shared
     SmaAtEncoder; bottleneck features are projected to lstm_hidden_dim via
     enc_proj and fed through ConvLSTMCell to build a temporal hidden state.
-    Skip connections from all input frames are averaged for use in decoding.
 
-    Decoding phase: the ConvLSTM is driven by learned step embeddings (one per
-    output step) for T_out steps; each hidden state is projected back to
-    bottleneck_dim via dec_proj and decoded by the shared SmaAtDecoder using
-    the averaged input skip connections.
+    Decoding phase: autoregressive frame-by-frame generation. Starting from
+    the last input frame, each step encodes the previous prediction, updates
+    the ConvLSTM with the new bottleneck, and decodes the next frame using
+    the fresh skip connections from that encoding. This means:
+      - predictions feed back as input (autoregressive),
+      - skip connections refresh every step instead of being a frozen average.
     """
 
     def __init__(self, T_in, T_out, kernels_per_layer=2, bilinear=True, reduction_ratio=16,
@@ -300,9 +294,6 @@ class SmaAtUNetTemporal(nn.Module):
         factor = 2 if bilinear else 1
         self.bottleneck_dim = 1024 // factor  # 512 when bilinear=True
         self.lstm_hidden_dim = lstm_hidden_dim
-        # Learned step embedding: maps decode step index → (lstm_hidden_dim,) vector
-        # then broadcast to spatial dims in forward()
-        self.step_embed = nn.Embedding(T_out, lstm_hidden_dim)
 
         self.encoder = SmaAtEncoder(
             kernels_per_layer=kernels_per_layer,
@@ -325,33 +316,31 @@ class SmaAtUNetTemporal(nn.Module):
         # x: (B, T_in, H, W)
         B, T_in, H, W = x.shape
 
-        # --- Encoding phase ---
+        # --- Encoding phase: build LSTM state from input frames ---
         h, c = None, None
-        skip_history = []
         for t in range(T_in):
-            bottleneck, skips = self.encoder(x[:, t:t + 1])  # (B,1,H,W)
-            lstm_in = self.enc_proj(bottleneck)               # (B, lstm_hidden_dim, h, w)
+            bottleneck, skips = self.encoder(x[:, t:t + 1])  # (B, 1, H, W)
+            lstm_in = self.enc_proj(bottleneck)
             if h is None:
                 h, c = self.convlstm.init_hidden(
                     B, lstm_in.shape[2], lstm_in.shape[3], x.device
                 )
-            skip_history.append(skips)
             h, c = self.convlstm(lstm_in, h, c)
 
-        fused_skips = mean_skip_connections(skip_history)
-
-        # --- Decoding phase ---
-        spatial_h, spatial_w = h.shape[2], h.shape[3]
+        # --- Decoding phase: autoregressive frame-by-frame ---
+        # prev_frame starts as the last input frame; each decoded frame
+        # becomes the input for the next step (skip connections refresh
+        # every step from the encoding of prev_frame).
         preds = []
-        for step in range(self.T_out):
-            step_idx = torch.full((B,), step, device=x.device, dtype=torch.long)
-            # (B, lstm_hidden_dim) → (B, lstm_hidden_dim, spatial_h, spatial_w)
-            step_input = self.step_embed(step_idx).unsqueeze(-1).unsqueeze(-1).expand(
-                B, self.lstm_hidden_dim, spatial_h, spatial_w
-            )
-            h, c = self.convlstm(step_input, h, c)
-            frame_pred = self.decoder(self.dec_proj(h), fused_skips)  # (B, 1, H, W)
-            preds.append(frame_pred.unsqueeze(1))     # (B, 1, 1, H, W)
+        prev_frame = x[:, -1:]  # (B, 1, H, W)
+
+        for _ in range(self.T_out):
+            bottleneck, skips = self.encoder(prev_frame)
+            lstm_in = self.enc_proj(bottleneck)
+            h, c = self.convlstm(lstm_in, h, c)
+            frame_pred = self.decoder(self.dec_proj(h), skips)  # (B, 1, H, W)
+            preds.append(frame_pred.unsqueeze(1))               # (B, 1, 1, H, W)
+            prev_frame = frame_pred
 
         return torch.cat(preds, dim=1)  # (B, T_out, 1, H, W)
 
