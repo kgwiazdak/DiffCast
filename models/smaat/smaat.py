@@ -286,14 +286,23 @@ class SmaAtUNetTemporal(nn.Module):
       - skip connections refresh every step instead of being a frozen average.
     """
 
-    def __init__(self, T_in, T_out, kernels_per_layer=2, bilinear=True, reduction_ratio=16,
-                 lstm_hidden_dim=256):
+    def __init__(
+        self,
+        T_in,
+        T_out,
+        kernels_per_layer=2,
+        bilinear=True,
+        reduction_ratio=16,
+        lstm_hidden_dim=256,
+        teacher_forcing_ratio=0.5,
+    ):
         super().__init__()
         self.T_in = T_in
         self.T_out = T_out
         factor = 2 if bilinear else 1
         self.bottleneck_dim = 1024 // factor  # 512 when bilinear=True
         self.lstm_hidden_dim = lstm_hidden_dim
+        self.teacher_forcing_ratio = teacher_forcing_ratio
 
         self.encoder = SmaAtEncoder(
             kernels_per_layer=kernels_per_layer,
@@ -312,9 +321,21 @@ class SmaAtUNetTemporal(nn.Module):
             reduction_ratio=reduction_ratio,
         )
 
-    def forward(self, x):
+    @staticmethod
+    def _bound_prediction(pred, reference):
+        ref_min = float(reference.detach().amin().item())
+        ref_max = float(reference.detach().amax().item())
+        if ref_min >= -1.1 and ref_max <= 1.1 and ref_min < 0.0:
+            return torch.tanh(pred)
+        if ref_min >= -0.1 and ref_max <= 1.1:
+            return torch.sigmoid(pred)
+        return pred
+
+    def forward(self, x, targets=None, teacher_forcing_ratio=None):
         # x: (B, T_in, H, W)
         B, T_in, H, W = x.shape
+        if teacher_forcing_ratio is None:
+            teacher_forcing_ratio = self.teacher_forcing_ratio
 
         # --- Encoding phase: build LSTM state from input frames ---
         h, c = None, None
@@ -334,13 +355,21 @@ class SmaAtUNetTemporal(nn.Module):
         preds = []
         prev_frame = x[:, -1:]  # (B, 1, H, W)
 
-        for _ in range(self.T_out):
+        for step in range(self.T_out):
             bottleneck, skips = self.encoder(prev_frame)
             lstm_in = self.enc_proj(bottleneck)
             h, c = self.convlstm(lstm_in, h, c)
             frame_pred = self.decoder(self.dec_proj(h), skips)  # (B, 1, H, W)
+            frame_pred = self._bound_prediction(frame_pred, x)
             preds.append(frame_pred.unsqueeze(1))               # (B, 1, 1, H, W)
-            prev_frame = frame_pred
+            if targets is not None and teacher_forcing_ratio > 0.0:
+                target_frame = targets[:, step]
+                use_teacher = (
+                    torch.rand((B, 1, 1, 1), device=x.device) < teacher_forcing_ratio
+                )
+                prev_frame = torch.where(use_teacher, target_frame, frame_pred)
+            else:
+                prev_frame = frame_pred
 
         return torch.cat(preds, dim=1)  # (B, T_out, 1, H, W)
 
@@ -355,6 +384,7 @@ class SmaAtNowcastBackbone(nn.Module):
             raise ValueError("SmaAt backbone currently supports single-channel radar input.")
         self.pre_seq_length = T_in
         self.aft_seq_length = T_out
+        self.loss_name = kwargs.get("loss_name", "mse")
         self.core = SmaAtUNetTemporal(
             T_in=T_in,
             T_out=T_out,
@@ -362,7 +392,17 @@ class SmaAtNowcastBackbone(nn.Module):
             bilinear=kwargs.get("bilinear", True),
             reduction_ratio=kwargs.get("reduction_ratio", 16),
             lstm_hidden_dim=kwargs.get("lstm_hidden_dim", 256),
+            teacher_forcing_ratio=kwargs.get("teacher_forcing_ratio", 0.5),
         )
+        self.last_rollout_stats = {}
+
+    def _compute_loss(self, pred, target):
+        if self.loss_name == "l1":
+            return F.l1_loss(pred, target)
+        if self.loss_name == "charbonnier":
+            eps = 1e-3
+            return torch.mean(torch.sqrt((pred - target) ** 2 + eps ** 2))
+        return F.mse_loss(pred, target)
 
     def predict(self, frames_in, frames_gt=None, compute_loss=False, **kwargs):
         # frames_in: (B, T_in, C, H, W) where C=1
@@ -373,10 +413,26 @@ class SmaAtNowcastBackbone(nn.Module):
                 f"but predict(..., T_out={requested_t_out}) was requested."
             )
         x = frames_in[:, :, 0]       # (B, T_in, H, W)
-        pred = self.core(x)           # (B, T_out, 1, H, W)
+        teacher_forcing_ratio = kwargs.get("teacher_forcing_ratio")
+        targets = frames_gt if compute_loss else None
+        pred = self.core(
+            x,
+            targets=targets,
+            teacher_forcing_ratio=teacher_forcing_ratio,
+        )  # (B, T_out, 1, H, W)
+        pred_detached = pred.detach()
+        self.last_rollout_stats = {
+            "pred_min": float(pred_detached.amin().item()),
+            "pred_max": float(pred_detached.amax().item()),
+            "pred_mean": float(pred_detached.mean().item()),
+            "pred_std": float(pred_detached.std().item()),
+            "teacher_forcing_ratio": float(
+                self.core.teacher_forcing_ratio if teacher_forcing_ratio is None else teacher_forcing_ratio
+            ),
+        }
         if not compute_loss:
             return pred, None
         if frames_gt is None:
             raise ValueError("frames_gt is required for compute_loss=True")
-        loss = F.mse_loss(pred, frames_gt)
+        loss = self._compute_loss(pred, frames_gt)
         return pred, loss

@@ -77,6 +77,19 @@ def create_parser():
     # --------------- Additional Ablation Configs ---------------
     parser.add_argument("--eval",           action="store_true",                 help="evaluation mode")
     parser.add_argument("--wandb_state",    type=str,   default='disabled',      help="wandb state config")
+    parser.add_argument(
+        "--smaat_teacher_forcing",
+        type=float,
+        default=0.5,
+        help="teacher forcing ratio for the autoregressive SmaAt backbone",
+    )
+    parser.add_argument(
+        "--smaat_loss",
+        type=str,
+        default="mse",
+        choices=["mse", "l1", "charbonnier"],
+        help="deterministic loss for the SmaAt backbone",
+    )
 
     args = parser.parse_args()
     return args
@@ -261,6 +274,8 @@ class Runner(object):
                 "in_shape": (self.args.img_channel, self.args.img_size, self.args.img_size),
                 "T_in": self.args.frames_in,
                 "T_out": self.args.frames_out,
+                "teacher_forcing_ratio": self.args.smaat_teacher_forcing,
+                "loss_name": self.args.smaat_loss,
             }
             model = get_model(**kwargs)
             
@@ -481,13 +496,22 @@ class Runner(object):
             frames_gt=frames_out,
             compute_loss=True,
             T_out=self.args.frames_out,
+            teacher_forcing_ratio=self.args.smaat_teacher_forcing,
         )
         if loss is None:
             raise ValueError("Loss is None, please check the model predict function")
         if isinstance(loss, tuple):
             total_loss, det_loss, diff_loss = loss
             return {'total_loss': total_loss, 'det_loss': det_loss, 'diff_loss': diff_loss}
-        return {'total_loss': loss}
+        loss_dict = {'total_loss': loss}
+        if self.args.backbone == 'smaat' and not self.args.use_diff:
+            raw_model = self.accelerator.unwrap_model(self.model)
+            stats = getattr(raw_model, "last_rollout_stats", None)
+            if stats:
+                for key in ("pred_min", "pred_max", "pred_mean", "pred_std", "teacher_forcing_ratio"):
+                    if key in stats:
+                        loss_dict[key] = torch.tensor(stats[key], device=loss.device)
+        return loss_dict
         
     
     @torch.no_grad()
