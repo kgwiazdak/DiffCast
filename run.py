@@ -9,6 +9,7 @@ import cProfile
 from tqdm import tqdm
 from datetime import timedelta
 
+import numpy as np
 import torch
 from accelerate import Accelerator
 from accelerate.utils import set_seed
@@ -25,7 +26,7 @@ from utils.metrics import Evaluator
 from utils.tools import print_log, cycle, show_img_info
 
 # Apply your own wandb api key to log online
-os.environ["WANDB_API_KEY"] = "YOUR_WANDB"
+os.environ["WANDB_API_KEY"] = "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"
 # os.environ["WANDB_SILENT"] = "true"
 os.environ["ACCELERATE_DEBUG_MODE"] = "1"
 
@@ -89,6 +90,24 @@ def create_parser():
         default="mse",
         choices=["mse", "l1", "charbonnier"],
         help="deterministic loss for the SmaAt backbone",
+    )
+    parser.add_argument(
+        "--diff_teacher_forcing_ratio",
+        type=float,
+        default=1.0,
+        help="teacher forcing ratio for DiffCast fragment conditioning during training",
+    )
+    parser.add_argument(
+        "--det_loss_weight",
+        type=float,
+        default=0.5,
+        help="weight for the deterministic backbone loss in DiffCast training",
+    )
+    parser.add_argument(
+        "--diff_loss_weight",
+        type=float,
+        default=0.5,
+        help="weight for the diffusion residual loss in DiffCast training",
     )
 
     args = parser.parse_args()
@@ -291,6 +310,7 @@ class Runner(object):
                 'T_in': self.args.frames_in,
                 'T_out': self.args.frames_out,
                 'sampling_timesteps': 250,
+                'diff_teacher_forcing_ratio': self.args.diff_teacher_forcing_ratio,
             }
             diff_model = get_model(**kwargs)
             diff_model.load_backbone(model)
@@ -374,13 +394,11 @@ class Runner(object):
             'ema': self.ema.state_dict(),
             'opt': self.optimizer.state_dict(),
             'scheduler': self.scheduler.state_dict(),
-
         }
         
         torch.save(data, osp.join(self.ckpt_path, f"ckpt-{self.cur_step}.pt"))
         print_log(f"Save checkpoint {self.cur_step} to {self.ckpt_path}", self.is_main)
-        
-        
+
     def load(self, milestone):
         # =================================
         # load model checkpoint
@@ -421,7 +439,7 @@ class Runner(object):
             
             for i, batch in enumerate(self.train_loader):
                 # train the model with mixed_precision
-                with self.accelerator.autocast(self.model):
+                with self.accelerator.autocast():
 
                     loss_dict = self._train_batch(batch)
                     self.accelerator.backward(loss_dict['total_loss'])
@@ -467,7 +485,7 @@ class Runner(object):
                     if not osp.exists(self.sanity_path):
                         try:
                             print_log(f" ========= Running Sanity Check ==========", self.is_main)
-                            radar_ori, radar_recon= self._sample_batch(batch)
+                            radar_ori, radar_recon, _ = self._sample_batch(batch)
                             os.makedirs(self.sanity_path)
                             if self.is_main:
                                 for i in range(radar_ori.shape[0]):
@@ -497,12 +515,25 @@ class Runner(object):
             compute_loss=True,
             T_out=self.args.frames_out,
             teacher_forcing_ratio=self.args.smaat_teacher_forcing,
+            diff_teacher_forcing_ratio=self.args.diff_teacher_forcing_ratio,
+            det_loss_weight=self.args.det_loss_weight,
+            diff_loss_weight=self.args.diff_loss_weight,
         )
         if loss is None:
             raise ValueError("Loss is None, please check the model predict function")
         if isinstance(loss, tuple):
-            total_loss, det_loss, diff_loss = loss
-            return {'total_loss': total_loss, 'det_loss': det_loss, 'diff_loss': diff_loss}
+            total_loss, det_loss, diff_loss, *extra = loss
+            loss_dict = {'total_loss': total_loss, 'det_loss': det_loss, 'diff_loss': diff_loss}
+            extra_names = (
+                'gt_res_abs_mean',
+                'pred_res_abs_mean',
+                'gt_res_std',
+                'pred_res_std',
+                'residual_amp_ratio',
+            )
+            for name, value in zip(extra_names, extra):
+                loss_dict[name] = value
+            return loss_dict
         loss_dict = {'total_loss': loss}
         if self.args.backbone == 'smaat' and not self.args.use_diff:
             raw_model = self.accelerator.unwrap_model(self.model)
@@ -515,17 +546,24 @@ class Runner(object):
         
     
     @torch.no_grad()
-    def _sample_batch(self, batch, use_ema=False):
-        sample_fn = self.ema.ema_model.predict if use_ema else self.model.predict
+    def _sample_batch(self, batch, use_ema=False, return_mu=False):
+        sample_model = self.ema.ema_model if use_ema else self.model
+        sample_fn = sample_model.predict
         frame_in = self.args.frames_in
         radar_batch = self._get_seq_data(batch)
         radar_input, radar_gt = radar_batch[:,:frame_in], radar_batch[:,frame_in:]
-        radar_pred, _ = sample_fn(radar_input,compute_loss=False)
+        radar_mu = None
+        if self.args.use_diff and return_mu and hasattr(sample_model, "sample"):
+            radar_pred, radar_mu, _ = sample_model.sample(radar_input, T_out=self.args.frames_out)
+        else:
+            radar_pred, _ = sample_fn(radar_input,compute_loss=False)
         
         radar_gt = self.accelerator.gather(radar_gt).detach().cpu().numpy()
         radar_pred = self.accelerator.gather(radar_pred).detach().cpu().numpy()
+        if radar_mu is not None:
+            radar_mu = self.accelerator.gather(radar_mu).detach().cpu().numpy()
 
-        return radar_gt, radar_pred
+        return radar_gt, radar_pred, radar_mu
     
     
     def test_samples(self, milestone, do_test=False):
@@ -544,12 +582,30 @@ class Runner(object):
                 thresholds=self.thresholds,
                 save_path=save_dir,
             )
+            mu_eval = Evaluator(
+                seq_len=self.args.frames_out,
+                value_scale=self.scale_value,
+                thresholds=self.thresholds,
+                save_path=save_dir,
+            ) if self.args.use_diff else None
+            pred_mu_abs_sum = 0.0
+            gt_mu_abs_sum = 0.0
+            residual_batches = 0
         # start test loop
         for batch in tqdm(data_loader,desc='Test Samples', disable=not self.is_main):
             # sample
-            radar_ori, radar_recon= self._sample_batch(batch)
+            radar_ori, radar_recon, radar_mu = self._sample_batch(
+                batch,
+                use_ema=True,
+                return_mu=self.args.use_diff,
+            )
             # evaluate result and save
             eval.evaluate(radar_ori, radar_recon)
+            if self.is_main and mu_eval is not None and radar_mu is not None:
+                mu_eval.evaluate(radar_ori, radar_mu)
+                pred_mu_abs_sum += float(np.mean(np.abs(radar_recon - radar_mu)))
+                gt_mu_abs_sum += float(np.mean(np.abs(radar_ori - radar_mu)))
+                residual_batches += 1
             if self.is_main:
                 for i in range(radar_ori.shape[0]):
                     self.visiual_save_fn(radar_recon[i], radar_ori[i], osp.join(save_dir, f"{cnt}-{i}/vil"),data_type='vil')
@@ -562,6 +618,20 @@ class Runner(object):
         if self.is_main:
             res = eval.done()
             print_log(f"Test Results: {res}")
+            if mu_eval is not None:
+                print_log("========== Backbone Mu Results ==========")
+                mu_res = mu_eval.done()
+                print_log(f"Mu Test Results: {mu_res}")
+                if residual_batches > 0:
+                    pred_mu_abs = pred_mu_abs_sum / residual_batches
+                    gt_mu_abs = gt_mu_abs_sum / residual_batches
+                    residual_ratio = pred_mu_abs / max(gt_mu_abs, 1e-8)
+                    print_log(
+                        "Residual Stats: "
+                        f"mean(abs(pred-mu))={pred_mu_abs:.6f}, "
+                        f"mean(abs(gt-mu))={gt_mu_abs:.6f}, "
+                        f"ratio={residual_ratio:.6f}"
+                    )
             print_log("="*30)
 
         

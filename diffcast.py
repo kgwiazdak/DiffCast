@@ -657,7 +657,8 @@ class GaussianDiffusion(nn.Module):
         auto_normalize = True,
         offset_noise_strength = 0.,  # https://www.crosslabs.org/blog/diffusion-with-offset-noise
         min_snr_loss_weight = False, # https://arxiv.org/abs/2303.09556
-        min_snr_gamma = 5
+        min_snr_gamma = 5,
+        diff_teacher_forcing_ratio = 1.0
     ):
         super().__init__()
         assert not model.random_or_learned_sinusoidal_cond
@@ -667,6 +668,7 @@ class GaussianDiffusion(nn.Module):
 
         self.channels = self.model.channels
         self.self_condition = self.model.self_condition
+        self.diff_teacher_forcing_ratio = diff_teacher_forcing_ratio
 
         self.objective = objective
 
@@ -803,23 +805,39 @@ class GaussianDiffusion(nn.Module):
         )
 
     def p_losses(self, x_start, t, cond=None, ctx=None, idx=None, noise=None):
+        loss, _ = self.p_losses_with_xstart(
+            x_start=x_start,
+            t=t,
+            cond=cond,
+            ctx=ctx,
+            idx=idx,
+            noise=noise,
+        )
+        return loss
+
+    def p_losses_with_xstart(self, x_start, t, cond=None, ctx=None, idx=None, noise=None):
         noise = default(noise, lambda: torch.randn_like(x_start))
         x = self.q_sample(x_start=x_start, t=t, noise=noise)
         model_out = self.model(x, t, cond=cond, ctx=ctx, idx=idx)
 
         if self.objective == 'pred_noise':
             target = noise
+            pred_x_start = self.predict_start_from_noise(x, t, model_out)
         elif self.objective == 'pred_x0':
             target = x_start
+            pred_x_start = model_out
         elif self.objective == 'pred_v':
             target = self.predict_v(x_start, t, noise)
+            pred_x_start = self.predict_start_from_v(x, t, model_out)
         else:
             raise ValueError(f'unknown objective {self.objective}')
+
+        pred_x_start = pred_x_start.clamp(-1., 1.)
 
         loss = F.mse_loss(model_out, target, reduction='none')
         loss = reduce(loss, 'b ... -> b', 'mean')
         loss = loss * extract(self.loss_weight, t, loss.shape)
-        return loss.mean()
+        return loss.mean(), pred_x_start
 
     def model_predictions(self, x, t, cond=None, ctx=None, idx=None, clip_x_start = False, rederive_pred_noise = False):
         model_output = self.model(x, t, cond=cond, ctx=ctx, idx=idx)
@@ -973,7 +991,15 @@ class GaussianDiffusion(nn.Module):
         backbone_output = self.unnormalize(backbone_output)
         return frames_pred, backbone_output, ys
 
-    def train_loss(self, frames_in, frames_gt, alpha=0.5):
+    def train_loss(
+        self,
+        frames_in,
+        frames_gt,
+        alpha=0.5,
+        diff_teacher_forcing_ratio=None,
+        det_loss_weight=None,
+        diff_loss_weight=None,
+    ):
         B, T_in, c, h, w = frames_in.shape
         T_out = frames_gt.shape[1]
         if T_out % T_in != 0:
@@ -990,6 +1016,13 @@ class GaussianDiffusion(nn.Module):
         losses = []
         pre_frag = frames_in
         pre_mu = None
+        gt_res_abs_means = []
+        pred_res_abs_means = []
+        gt_res_stds = []
+        pred_res_stds = []
+        diff_teacher_forcing_ratio = default(diff_teacher_forcing_ratio, self.diff_teacher_forcing_ratio)
+        det_loss_weight = default(det_loss_weight, alpha)
+        diff_loss_weight = default(diff_loss_weight, 1 - alpha)
 
         for frag_idx in range(T_out // T_in):
             mu = backbone_output[:, frag_idx * T_in : (frag_idx + 1) * T_in]
@@ -1001,22 +1034,57 @@ class GaussianDiffusion(nn.Module):
             idx = torch.full((B,), frag_idx, device=frames_in.device, dtype=torch.long)
             t = torch.randint(0, self.num_timesteps, (B,), device=frames_in.device).long()
 
-            losses.append(self.p_losses(residual, t, cond=cond, ctx=ctx, idx=idx))
+            loss, pred_residual = self.p_losses_with_xstart(
+                residual,
+                t,
+                cond=cond,
+                ctx=ctx,
+                idx=idx,
+            )
+            losses.append(loss)
 
-            pre_frag = gt
+            frag_pred = (mu + pred_residual).detach()
+            gt_res_abs_means.append(residual.abs().mean())
+            pred_res_abs_means.append(pred_residual.abs().mean())
+            gt_res_stds.append(residual.std(unbiased=False))
+            pred_res_stds.append(pred_residual.std(unbiased=False))
+
+            if diff_teacher_forcing_ratio >= 1.0:
+                pre_frag = gt
+            elif diff_teacher_forcing_ratio <= 0.0:
+                pre_frag = frag_pred
+            else:
+                teacher_mask = torch.rand((B, 1, 1, 1, 1), device=frames_in.device) < diff_teacher_forcing_ratio
+                pre_frag = torch.where(teacher_mask, gt, frag_pred)
             pre_mu = mu
 
         diff_loss = torch.stack(losses).mean()
-        total_loss = alpha * det_loss + (1 - alpha) * diff_loss
-        return total_loss, det_loss.detach(), diff_loss.detach()
+        residual_amp_ratio = torch.stack(pred_res_abs_means).mean() / torch.stack(gt_res_abs_means).mean().clamp(min=1e-8)
+        total_loss = det_loss_weight * det_loss + diff_loss_weight * diff_loss
+        return (
+            total_loss,
+            det_loss.detach(),
+            diff_loss.detach(),
+            torch.stack(gt_res_abs_means).mean().detach(),
+            torch.stack(pred_res_abs_means).mean().detach(),
+            torch.stack(gt_res_stds).mean().detach(),
+            torch.stack(pred_res_stds).mean().detach(),
+            residual_amp_ratio.detach(),
+        )
     
 
     def predict(self, frames_in, frames_gt=None, compute_loss=False, **kwargs):
         if compute_loss:
             if frames_gt is None:
                 raise ValueError("frames_gt is required for diffusion training")
-            total, det, diff = self.train_loss(frames_in=frames_in, frames_gt=frames_gt)
-            return None, (total, det, diff)
+            loss_items = self.train_loss(
+                frames_in=frames_in,
+                frames_gt=frames_gt,
+                diff_teacher_forcing_ratio=kwargs.get('diff_teacher_forcing_ratio'),
+                det_loss_weight=kwargs.get('det_loss_weight'),
+                diff_loss_weight=kwargs.get('diff_loss_weight'),
+            )
+            return None, loss_items
 
         T_out = default(kwargs.get('T_out'), 20)
         pred, mu, y = self.sample(frames_in=frames_in, T_out=T_out)
@@ -1053,7 +1121,8 @@ def get_model(
         model = unet,
         ctx_net = context_net,
         timesteps = timesteps,           # number of steps
-        sampling_timesteps = sampling_timesteps,        
+        sampling_timesteps = sampling_timesteps,
+        diff_teacher_forcing_ratio = kwargs.get('diff_teacher_forcing_ratio', 1.0),
     )
     
     return diffusion
