@@ -658,7 +658,8 @@ class GaussianDiffusion(nn.Module):
         offset_noise_strength = 0.,  # https://www.crosslabs.org/blog/diffusion-with-offset-noise
         min_snr_loss_weight = False, # https://arxiv.org/abs/2303.09556
         min_snr_gamma = 5,
-        diff_teacher_forcing_ratio = 1.0
+        diff_teacher_forcing_ratio = 1.0,
+        train_sampling_timesteps = 8,
     ):
         super().__init__()
         assert not model.random_or_learned_sinusoidal_cond
@@ -699,6 +700,7 @@ class GaussianDiffusion(nn.Module):
         assert self.sampling_timesteps <= timesteps
         self.is_ddim_sampling = self.sampling_timesteps < timesteps
         self.ddim_sampling_eta = ddim_sampling_eta
+        self.train_sampling_timesteps = max(1, min(train_sampling_timesteps, self.sampling_timesteps))
 
         # helper function to register buffer from float64 to float32
 
@@ -900,8 +902,11 @@ class GaussianDiffusion(nn.Module):
         return ret
 
     @torch.no_grad()
-    def ddim_sample(self, shape, cond=None, ctx=None, idx=None, return_all_timesteps = False):
-        batch, total_timesteps, sampling_timesteps, eta, objective = shape[0], self.num_timesteps, self.sampling_timesteps, self.ddim_sampling_eta, self.objective
+    def ddim_sample(self, shape, cond=None, ctx=None, idx=None, return_all_timesteps = False, sampling_timesteps = None, eta = None):
+        batch, total_timesteps = shape[0], self.num_timesteps
+        sampling_timesteps = default(sampling_timesteps, self.sampling_timesteps)
+        eta = default(eta, self.ddim_sampling_eta)
+        objective = self.objective
         device = cond.device if cond is not None else self.device
         times = torch.linspace(-1, total_timesteps - 1, steps = sampling_timesteps + 1)   # [-1, 0, 1, 2, ..., T-1] when sampling_timesteps == total_timesteps
         times = list(reversed(times.int().tolist()))
@@ -940,12 +945,24 @@ class GaussianDiffusion(nn.Module):
         return ret
 
     @torch.no_grad()
+    def sample_residual_for_training(self, shape, cond=None, ctx=None, idx=None):
+        return self.ddim_sample(
+            shape,
+            cond=cond,
+            ctx=ctx,
+            idx=idx,
+            sampling_timesteps=self.train_sampling_timesteps,
+            eta=0.0,
+        )
+
+    @torch.no_grad()
     def sample(self, frames_in, T_out, return_all_timesteps = False):
         B, T_in, c, h, w = frames_in.shape
         device = self.device
-        frames_in = self.normalize(frames_in)
         backbone_output, _ = self.backbone_net.predict(frames_in)
-        
+        frames_in = self.normalize(frames_in)
+        backbone_output = self.normalize(backbone_output)
+
         global_ctx, local_ctx = self.ctx_net.scan_ctx(torch.cat((frames_in, backbone_output), dim=1))
         
         # frames_in = rearrange(frames_in, 'b t c h w -> b (t c) h w')
@@ -1005,11 +1022,12 @@ class GaussianDiffusion(nn.Module):
         if T_out % T_in != 0:
             raise ValueError(f"T_out ({T_out}) must be divisible by T_in ({T_in})")
 
-        frames_in = self.normalize(frames_in)
-        frames_gt = self.normalize(frames_gt)
         backbone_output, det_loss = self.backbone_net.predict(
             frames_in, frames_gt=frames_gt, compute_loss=True
         )
+        frames_in = self.normalize(frames_in)
+        frames_gt = self.normalize(frames_gt)
+        backbone_output = self.normalize(backbone_output)
 
         global_ctx, local_ctx = self.ctx_net.scan_ctx(torch.cat((frames_in, backbone_output), dim=1))
 
@@ -1020,7 +1038,6 @@ class GaussianDiffusion(nn.Module):
         pred_res_abs_means = []
         gt_res_stds = []
         pred_res_stds = []
-        diff_teacher_forcing_ratio = default(diff_teacher_forcing_ratio, self.diff_teacher_forcing_ratio)
         det_loss_weight = default(det_loss_weight, alpha)
         diff_loss_weight = default(diff_loss_weight, 1 - alpha)
 
@@ -1043,20 +1060,20 @@ class GaussianDiffusion(nn.Module):
             )
             losses.append(loss)
 
-            frag_pred = (mu + pred_residual).detach()
             gt_res_abs_means.append(residual.abs().mean())
             pred_res_abs_means.append(pred_residual.abs().mean())
             gt_res_stds.append(residual.std(unbiased=False))
             pred_res_stds.append(pred_residual.std(unbiased=False))
 
-            if diff_teacher_forcing_ratio >= 1.0:
-                pre_frag = gt
-            elif diff_teacher_forcing_ratio <= 0.0:
-                pre_frag = frag_pred
-            else:
-                teacher_mask = torch.rand((B, 1, 1, 1, 1), device=frames_in.device) < diff_teacher_forcing_ratio
-                pre_frag = torch.where(teacher_mask, gt, frag_pred)
-            pre_mu = mu
+            if frag_idx < (T_out // T_in) - 1:
+                sampled_residual = self.sample_residual_for_training(
+                    residual.shape,
+                    cond=cond,
+                    ctx=ctx,
+                    idx=idx,
+                )
+                pre_frag = (mu + sampled_residual).detach()
+                pre_mu = mu
 
         diff_loss = torch.stack(losses).mean()
         residual_amp_ratio = torch.stack(pred_res_abs_means).mean() / torch.stack(gt_res_abs_means).mean().clamp(min=1e-8)
@@ -1101,6 +1118,7 @@ def get_model(
     T_out = 20,
     timesteps = 1000,           # number of steps
     sampling_timesteps = 250,    # number of sampling timesteps (using ddim for faster inference [see citation for ddim paper])
+    train_sampling_timesteps = 8,
     **kwargs
 ):
     
@@ -1123,6 +1141,7 @@ def get_model(
         timesteps = timesteps,           # number of steps
         sampling_timesteps = sampling_timesteps,
         diff_teacher_forcing_ratio = kwargs.get('diff_teacher_forcing_ratio', 1.0),
+        train_sampling_timesteps = train_sampling_timesteps,
     )
     
     return diffusion

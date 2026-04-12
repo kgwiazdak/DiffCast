@@ -95,7 +95,13 @@ def create_parser():
         "--diff_teacher_forcing_ratio",
         type=float,
         default=1.0,
-        help="teacher forcing ratio for DiffCast fragment conditioning during training",
+        help="deprecated: kept for CLI compatibility, ignored by the current DiffCast training path",
+    )
+    parser.add_argument(
+        "--train_sampling_timesteps",
+        type=int,
+        default=8,
+        help="number of DDIM steps used by the training-time conditioning sampler",
     )
     parser.add_argument(
         "--det_loss_weight",
@@ -310,11 +316,17 @@ class Runner(object):
                 'T_in': self.args.frames_in,
                 'T_out': self.args.frames_out,
                 'sampling_timesteps': 250,
+                'train_sampling_timesteps': self.args.train_sampling_timesteps,
                 'diff_teacher_forcing_ratio': self.args.diff_teacher_forcing_ratio,
             }
             diff_model = get_model(**kwargs)
             diff_model.load_backbone(model)
             model = diff_model
+            if self.is_main and self.args.diff_teacher_forcing_ratio != 1.0:
+                print_log(
+                    "Warning: --diff_teacher_forcing_ratio is deprecated and ignored in the current DiffCast training path.",
+                    self.is_main,
+                )
             
         self.model = model
         self.ema = EMA(self.model, beta=self.args.ema_rate, update_every=20).to(self.device)        
@@ -590,7 +602,13 @@ class Runner(object):
             ) if self.args.use_diff else None
             pred_mu_abs_sum = 0.0
             gt_mu_abs_sum = 0.0
-            residual_batches = 0
+            res_mae_sum = 0.0
+            pred_res_sum = 0.0
+            gt_res_sum = 0.0
+            pred_res_sq_sum = 0.0
+            gt_res_sq_sum = 0.0
+            res_cross_sum = 0.0
+            residual_count = 0
         # start test loop
         for batch in tqdm(data_loader,desc='Test Samples', disable=not self.is_main):
             # sample
@@ -603,9 +621,17 @@ class Runner(object):
             eval.evaluate(radar_ori, radar_recon)
             if self.is_main and mu_eval is not None and radar_mu is not None:
                 mu_eval.evaluate(radar_ori, radar_mu)
-                pred_mu_abs_sum += float(np.mean(np.abs(radar_recon - radar_mu)))
-                gt_mu_abs_sum += float(np.mean(np.abs(radar_ori - radar_mu)))
-                residual_batches += 1
+                pred_res = (radar_recon - radar_mu).astype(np.float64, copy=False)
+                gt_res = (radar_ori - radar_mu).astype(np.float64, copy=False)
+                pred_mu_abs_sum += float(np.abs(pred_res).sum())
+                gt_mu_abs_sum += float(np.abs(gt_res).sum())
+                res_mae_sum += float(np.abs(pred_res - gt_res).sum())
+                pred_res_sum += float(pred_res.sum())
+                gt_res_sum += float(gt_res.sum())
+                pred_res_sq_sum += float(np.square(pred_res).sum())
+                gt_res_sq_sum += float(np.square(gt_res).sum())
+                res_cross_sum += float((pred_res * gt_res).sum())
+                residual_count += pred_res.size
             if self.is_main:
                 for i in range(radar_ori.shape[0]):
                     self.visiual_save_fn(radar_recon[i], radar_ori[i], osp.join(save_dir, f"{cnt}-{i}/vil"),data_type='vil')
@@ -622,15 +648,28 @@ class Runner(object):
                 print_log("========== Backbone Mu Results ==========")
                 mu_res = mu_eval.done()
                 print_log(f"Mu Test Results: {mu_res}")
-                if residual_batches > 0:
-                    pred_mu_abs = pred_mu_abs_sum / residual_batches
-                    gt_mu_abs = gt_mu_abs_sum / residual_batches
-                    residual_ratio = pred_mu_abs / max(gt_mu_abs, 1e-8)
+                if residual_count > 0:
+                    pred_mu_abs = pred_mu_abs_sum / residual_count
+                    gt_mu_abs = gt_mu_abs_sum / residual_count
+                    res_mae = res_mae_sum / residual_count
+                    pred_res_mean = pred_res_sum / residual_count
+                    gt_res_mean = gt_res_sum / residual_count
+                    pred_res_var = max(pred_res_sq_sum / residual_count - pred_res_mean ** 2, 0.0)
+                    gt_res_var = max(gt_res_sq_sum / residual_count - gt_res_mean ** 2, 0.0)
+                    pred_res_std = pred_res_var ** 0.5
+                    gt_res_std = gt_res_var ** 0.5
+                    res_cov = res_cross_sum / residual_count - pred_res_mean * gt_res_mean
+                    abs_ratio = pred_mu_abs / max(gt_mu_abs, 1e-8)
+                    std_ratio = pred_res_std / max(gt_res_std, 1e-8)
+                    res_corr = res_cov / max(pred_res_std * gt_res_std, 1e-8)
                     print_log(
                         "Residual Stats: "
                         f"mean(abs(pred-mu))={pred_mu_abs:.6f}, "
                         f"mean(abs(gt-mu))={gt_mu_abs:.6f}, "
-                        f"ratio={residual_ratio:.6f}"
+                        f"abs_ratio={abs_ratio:.6f}, "
+                        f"std_ratio={std_ratio:.6f}, "
+                        f"res_mae={res_mae:.6f}, "
+                        f"res_corr={res_corr:.6f}"
                     )
             print_log("="*30)
 
