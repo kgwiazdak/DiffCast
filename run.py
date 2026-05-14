@@ -4,6 +4,7 @@ import math
 import time
 import argparse
 import logging 
+import re
 import yaml
 import cProfile
 from tqdm import tqdm
@@ -74,9 +75,65 @@ def create_parser():
     parser.add_argument("--training_steps", type=int,   default=200000,          help="number of training steps")
     parser.add_argument("--early_stop",     type=int,   default=10,              help="early stopping steps")
     parser.add_argument("--ckpt_milestone", type=str,   default=None,            help="resumed checkpoint milestone")
+    parser.add_argument(
+        "--backbone_ckpt",
+        type=str,
+        default=None,
+        help="checkpoint containing a deterministic backbone state to load before optional DiffCast wrapping",
+    )
+    parser.add_argument(
+        "--freeze_backbone",
+        action="store_true",
+        default=False,
+        help="freeze the deterministic backbone after loading/building it; useful for residual-only DiffCast training",
+    )
+    parser.add_argument(
+        "--max_checkpoints",
+        type=int,
+        default=3,
+        help="maximum number of saved checkpoints to keep; set to 0 to disable pruning",
+    )
     
     # --------------- Additional Ablation Configs ---------------
     parser.add_argument("--eval",           action="store_true",                 help="evaluation mode")
+    parser.add_argument(
+        "--eval_split",
+        type=str,
+        default="test",
+        choices=["valid", "test"],
+        help="dataset split used by --eval; use valid for hyperparameter selection and test only for final reporting",
+    )
+    parser.add_argument(
+        "--eval_conditioning_mode",
+        type=str,
+        default="autoregressive",
+        choices=["autoregressive", "oracle_gt"],
+        help="conditioning mode used only during diffusion eval diagnostics",
+    )
+    parser.add_argument(
+        "--residual_scale",
+        type=float,
+        default=1.0,
+        help="inference-only scale applied to the diffusion residual before adding it to backbone mu",
+    )
+    parser.add_argument(
+        "--eval_residual_scales",
+        type=str,
+        default=None,
+        help="comma-separated residual scales evaluated in one diffusion pass, e.g. 0,0.25,0.5,0.75",
+    )
+    parser.add_argument(
+        "--eval_max_batches",
+        type=int,
+        default=None,
+        help="optional maximum number of eval batches; use only for quick diagnostics, not final reporting",
+    )
+    parser.add_argument(
+        "--skip_eval_image_save",
+        action="store_true",
+        default=False,
+        help="skip saving per-sample eval images to speed up calibration sweeps",
+    )
     parser.add_argument("--wandb_state",    type=str,   default='disabled',      help="wandb state config")
     parser.add_argument(
         "--smaat_teacher_forcing",
@@ -191,6 +248,53 @@ class Runner(object):
     @property
     def device(self):
         return self.accelerator.device
+
+    def _resolve_checkpoint_path(self, milestone):
+        milestone = str(milestone)
+        if milestone.endswith(".pt") or osp.sep in milestone or "/" in milestone or "\\" in milestone:
+            return osp.abspath(milestone)
+        return osp.abspath(osp.join(self.ckpt_path, f"ckpt-{milestone}.pt"))
+
+    def _strip_state_prefix(self, state_dict, prefix):
+        stripped = {key[len(prefix):]: value for key, value in state_dict.items() if key.startswith(prefix)}
+        if not stripped:
+            return None
+        return stripped
+
+    def _load_module_checkpoint(self, module, checkpoint_path, label):
+        resolved_path = self._resolve_checkpoint_path(checkpoint_path)
+        if not osp.exists(resolved_path):
+            raise FileNotFoundError(f"{label} checkpoint does not exist: {resolved_path}")
+
+        data = torch.load(resolved_path, map_location="cpu")
+        state_dict = data["model"] if isinstance(data, dict) and "model" in data else data
+        if not isinstance(state_dict, dict):
+            raise ValueError(f"{label} checkpoint at {resolved_path} does not contain a state dict")
+
+        candidates = [state_dict]
+        for prefix in ("module.", "_orig_mod.", "backbone_net.", "module.backbone_net.", "_orig_mod.backbone_net."):
+            stripped = self._strip_state_prefix(state_dict, prefix)
+            if stripped is not None:
+                candidates.append(stripped)
+
+        errors = []
+        for candidate in candidates:
+            try:
+                module.load_state_dict(candidate, strict=True)
+                print_log(f"Loaded {label} checkpoint from {resolved_path}", self.is_main)
+                return resolved_path
+            except RuntimeError as exc:
+                errors.append(str(exc))
+
+        raise RuntimeError(
+            f"Failed to load {label} checkpoint from {resolved_path}. "
+            f"Tried raw state and common prefixes. Last error: {errors[-1] if errors else 'unknown'}"
+        )
+
+    def _freeze_module(self, module, label):
+        for param in module.parameters():
+            param.requires_grad = False
+        print_log(f"Froze {label} parameters", self.is_main)
     
     def _preparation(self):
         # =================================
@@ -306,6 +410,15 @@ class Runner(object):
             
         else:
             raise NotImplementedError
+
+        if self.args.backbone_ckpt is not None:
+            self._load_module_checkpoint(model, self.args.backbone_ckpt, f"{self.args.backbone} backbone")
+
+        if self.args.freeze_backbone and not self.args.use_diff:
+            raise ValueError("--freeze_backbone requires --use_diff; otherwise no trainable model remains")
+
+        if self.args.freeze_backbone:
+            self._freeze_module(model, f"{self.args.backbone} backbone")
         
         if self.args.use_diff:
             from diffcast import get_model
@@ -407,24 +520,58 @@ class Runner(object):
             'opt': self.optimizer.state_dict(),
             'scheduler': self.scheduler.state_dict(),
         }
-        
-        torch.save(data, osp.join(self.ckpt_path, f"ckpt-{self.cur_step}.pt"))
+
+        final_path = osp.join(self.ckpt_path, f"ckpt-{self.cur_step}.pt")
+        tmp_path = f"{final_path}.tmp.{os.getpid()}"
+
+        if osp.exists(tmp_path):
+            os.remove(tmp_path)
+
+        try:
+            torch.save(data, tmp_path)
+            os.replace(tmp_path, final_path)
+            self._prune_old_checkpoints(keep=self.args.max_checkpoints)
+        except Exception as exc:
+            if osp.exists(tmp_path):
+                os.remove(tmp_path)
+            raise RuntimeError(
+                f"Failed to save checkpoint to {final_path}. Check filesystem health, free space, and quota."
+            ) from exc
+
         print_log(f"Save checkpoint {self.cur_step} to {self.ckpt_path}", self.is_main)
+
+    def _prune_old_checkpoints(self, keep):
+        if keep is None or keep <= 0:
+            return
+
+        checkpoint_files = []
+        for name in os.listdir(self.ckpt_path):
+            match = re.fullmatch(r"ckpt-(\d+)\.pt", name)
+            if match is None:
+                continue
+            checkpoint_files.append((int(match.group(1)), osp.join(self.ckpt_path, name)))
+
+        if len(checkpoint_files) <= keep:
+            return
+
+        checkpoint_files.sort(key=lambda item: item[0], reverse=True)
+        for _, old_path in checkpoint_files[keep:]:
+            os.remove(old_path)
+            print_log(f"Remove old checkpoint {old_path}", self.is_main)
 
     def load(self, milestone):
         # =================================
         # load model checkpoint
-        # =================================        
+        # =================================
+        resolved_path = self._resolve_checkpoint_path(milestone)
+        if not osp.exists(resolved_path):
+            raise FileNotFoundError(f"Checkpoint does not exist: {resolved_path}")
+
         device = self.accelerator.device
-        
-        if '.pt' in milestone:
-            data = torch.load(milestone, map_location=device)
-        else:
-            data = torch.load(osp.join(self.ckpt_path, f"ckpt-{milestone}.pt"), map_location=device)
+        data = torch.load(resolved_path, map_location=device)
         
         model = self.accelerator.unwrap_model(self.model)
         model.load_state_dict(data['model'])
-        self.model = self.accelerator.prepare(model)
         
         self.optimizer.load_state_dict(data['opt'])
         self.scheduler.load_state_dict(data['scheduler'])
@@ -432,9 +579,13 @@ class Runner(object):
         if self.is_main:
             self.ema.load_state_dict(data['ema'])
 
-        # self.cur_epoch = data['epoch']
-        # self.cur_step = data['step']
-        print_log(f"Load checkpoint {milestone} from {self.ckpt_path}", self.is_main)
+        self.cur_step = data['step']
+        # Checkpoints are saved at the end of an epoch, so resume from the next one.
+        self.cur_epoch = data['epoch'] + 1
+        print_log(
+            f"Load checkpoint {resolved_path} (requested: {milestone}) and resume at epoch {self.cur_epoch}, step {self.cur_step}",
+            self.is_main,
+        )
         
     
     def train(self):
@@ -516,12 +667,16 @@ class Runner(object):
     def _get_seq_data(self, batch):
         # frame_seq = batch['vil'].unsqueeze(2).to(self.device)
         return batch      # [B, T, C, H, W]
+
+    def _predict_model(self, *args, **kwargs):
+        model = self.accelerator.unwrap_model(self.model)
+        return model.predict(*args, **kwargs)
     
     def _train_batch(self, batch):
         radar_batch = self._get_seq_data(batch)
         frames_in, frames_out = radar_batch[:,:self.args.frames_in], radar_batch[:,self.args.frames_in:]
         assert radar_batch.shape[1] == self.args.frames_out + self.args.frames_in, "radar sequence length error"
-        _, loss = self.model.predict(
+        _, loss = self._predict_model(
             frames_in=frames_in,
             frames_gt=frames_out,
             compute_loss=True,
@@ -558,15 +713,22 @@ class Runner(object):
         
     
     @torch.no_grad()
-    def _sample_batch(self, batch, use_ema=False, return_mu=False):
-        sample_model = self.ema.ema_model if use_ema else self.model
+    def _sample_batch(self, batch, use_ema=False, return_mu=False, return_residual=False):
+        sample_model = self.ema.ema_model if use_ema else self.accelerator.unwrap_model(self.model)
         sample_fn = sample_model.predict
         frame_in = self.args.frames_in
         radar_batch = self._get_seq_data(batch)
         radar_input, radar_gt = radar_batch[:,:frame_in], radar_batch[:,frame_in:]
         radar_mu = None
+        radar_residual = None
         if self.args.use_diff and return_mu and hasattr(sample_model, "sample"):
-            radar_pred, radar_mu, _ = sample_model.sample(radar_input, T_out=self.args.frames_out)
+            radar_pred, radar_mu, radar_residual = sample_model.sample(
+                radar_input,
+                T_out=self.args.frames_out,
+                frames_gt=radar_gt,
+                conditioning_mode=self.args.eval_conditioning_mode,
+                residual_scale=self.args.residual_scale,
+            )
         else:
             radar_pred, _ = sample_fn(radar_input,compute_loss=False)
         
@@ -574,127 +736,429 @@ class Runner(object):
         radar_pred = self.accelerator.gather(radar_pred).detach().cpu().numpy()
         if radar_mu is not None:
             radar_mu = self.accelerator.gather(radar_mu).detach().cpu().numpy()
+        if radar_residual is not None:
+            radar_residual = self.accelerator.gather(radar_residual).detach().cpu().numpy()
 
+        if return_residual:
+            return radar_gt, radar_pred, radar_mu, radar_residual
         return radar_gt, radar_pred, radar_mu
+
+    def _summarize_evaluator(self, evaluator):
+        avg_csi, avg_far, avg_pod, avg_hss = [], [], [], []
+        avg_csi44, avg_csi16 = [], []
+        for threshold in evaluator.thresholds:
+            hits = np.nan_to_num(np.array(evaluator.metrics[threshold]["hits"]))
+            misses = np.nan_to_num(np.array(evaluator.metrics[threshold]["misses"]))
+            falsealarms = np.nan_to_num(np.array(evaluator.metrics[threshold]["falsealarms"]))
+            correctnegs = np.nan_to_num(np.array(evaluator.metrics[threshold]["correctnegs"]))
+
+            csi = np.nan_to_num(
+                np.mean(hits, axis=0)
+                / (np.mean(hits, axis=0) + np.mean(misses, axis=0) + np.mean(falsealarms, axis=0))
+            )
+            far = np.nan_to_num(
+                np.mean(falsealarms, axis=0)
+                / (np.mean(hits, axis=0) + np.mean(falsealarms, axis=0))
+            )
+            pod = np.nan_to_num(
+                np.mean(hits, axis=0)
+                / (np.mean(hits, axis=0) + np.mean(misses, axis=0))
+            )
+            hss = np.nan_to_num(
+                2
+                * (
+                    np.mean(hits, axis=0) * np.mean(correctnegs, axis=0)
+                    - np.mean(misses, axis=0) * np.mean(falsealarms, axis=0)
+                )
+                / (
+                    (np.mean(hits, axis=0) + np.mean(misses, axis=0))
+                    * (np.mean(misses, axis=0) + np.mean(correctnegs, axis=0))
+                    + (np.mean(hits, axis=0) + np.mean(falsealarms, axis=0))
+                    * (np.mean(falsealarms, axis=0) + np.mean(correctnegs, axis=0))
+                )
+            )
+
+            hits44 = np.array(evaluator.metrics[threshold]["hits44"])
+            misses44 = np.array(evaluator.metrics[threshold]["misses44"])
+            falsealarms44 = np.array(evaluator.metrics[threshold]["falsealarms44"])
+
+            hits16 = np.array(evaluator.metrics[threshold]["hits16"])
+            misses16 = np.array(evaluator.metrics[threshold]["misses16"])
+            falsealarms16 = np.array(evaluator.metrics[threshold]["falsealarms16"])
+
+            avg_csi.append(np.mean(csi))
+            avg_far.append(np.mean(far))
+            avg_pod.append(np.mean(pod))
+            avg_hss.append(np.mean(hss))
+            avg_csi44.append(
+                np.mean(hits44) / (np.mean(hits44) + np.mean(misses44) + np.mean(falsealarms44))
+            )
+            avg_csi16.append(
+                np.mean(hits16) / (np.mean(hits16) + np.mean(misses16) + np.mean(falsealarms16))
+            )
+
+        return {
+            "csi": float(np.nan_to_num(np.mean(avg_csi))),
+            "far": float(np.nan_to_num(np.mean(avg_far))),
+            "pod": float(np.nan_to_num(np.mean(avg_pod))),
+            "hss": float(np.nan_to_num(np.mean(avg_hss))),
+            "csi_pool_4x4": float(np.nan_to_num(np.mean(avg_csi44))),
+            "csi_pool_16x16": float(np.nan_to_num(np.mean(avg_csi16))),
+        }
+
+    def _make_residual_stats_accumulator(self):
+        return {
+            "pred_abs_sum": 0.0,
+            "gt_abs_sum": 0.0,
+            "res_mae_sum": 0.0,
+            "pred_sum": 0.0,
+            "gt_sum": 0.0,
+            "pred_sq_sum": 0.0,
+            "gt_sq_sum": 0.0,
+            "cross_sum": 0.0,
+            "count": 0,
+        }
+
+    def _update_residual_stats(self, stats, pred_res, gt_res):
+        pred_res = pred_res.astype(np.float64, copy=False)
+        gt_res = gt_res.astype(np.float64, copy=False)
+        stats["pred_abs_sum"] += float(np.abs(pred_res).sum())
+        stats["gt_abs_sum"] += float(np.abs(gt_res).sum())
+        stats["res_mae_sum"] += float(np.abs(pred_res - gt_res).sum())
+        stats["pred_sum"] += float(pred_res.sum())
+        stats["gt_sum"] += float(gt_res.sum())
+        stats["pred_sq_sum"] += float(np.square(pred_res).sum())
+        stats["gt_sq_sum"] += float(np.square(gt_res).sum())
+        stats["cross_sum"] += float((pred_res * gt_res).sum())
+        stats["count"] += pred_res.size
+
+    def _finalize_residual_stats(self, stats):
+        if stats["count"] <= 0:
+            return None
+        pred_abs = stats["pred_abs_sum"] / stats["count"]
+        gt_abs = stats["gt_abs_sum"] / stats["count"]
+        res_mae = stats["res_mae_sum"] / stats["count"]
+        pred_mean = stats["pred_sum"] / stats["count"]
+        gt_mean = stats["gt_sum"] / stats["count"]
+        pred_var = max(stats["pred_sq_sum"] / stats["count"] - pred_mean ** 2, 0.0)
+        gt_var = max(stats["gt_sq_sum"] / stats["count"] - gt_mean ** 2, 0.0)
+        pred_std = pred_var ** 0.5
+        gt_std = gt_var ** 0.5
+        cov = stats["cross_sum"] / stats["count"] - pred_mean * gt_mean
+        return {
+            "pred_abs": pred_abs,
+            "gt_abs": gt_abs,
+            "abs_ratio": pred_abs / max(gt_abs, 1e-8),
+            "std_ratio": pred_std / max(gt_std, 1e-8),
+            "res_mae": res_mae,
+            "res_corr": cov / max(pred_std * gt_std, 1e-8),
+        }
     
+    def _get_eval_split(self, split):
+        if split == "valid":
+            return self.valid_loader, self.valid_path, "Valid"
+        if split == "test":
+            return self.test_loader, self.test_path, "Test"
+        raise ValueError(f"Unknown eval split: {split}")
+
+    def _get_eval_residual_scales(self):
+        if not self.args.use_diff or self.args.eval_residual_scales is None:
+            return [self.args.residual_scale]
+
+        scales = []
+        for raw_scale in self.args.eval_residual_scales.split(","):
+            raw_scale = raw_scale.strip()
+            if not raw_scale:
+                continue
+            scales.append(float(raw_scale))
+
+        if not scales:
+            raise ValueError("--eval_residual_scales was provided but no numeric scales were parsed")
+
+        return scales
+
+    def _make_eval_bundle(self, seq_len, save_path):
+        return {
+            "eval": Evaluator(
+                seq_len=seq_len,
+                value_scale=self.scale_value,
+                thresholds=self.thresholds,
+                save_path=save_path,
+            ),
+            "frag1_eval": Evaluator(
+                seq_len=min(self.args.frames_in, seq_len),
+                value_scale=self.scale_value,
+                thresholds=self.thresholds,
+                save_path=save_path,
+            ),
+            "residual_stats": self._make_residual_stats_accumulator(),
+            "frag1_residual_stats": self._make_residual_stats_accumulator(),
+        }
+
+    def _update_eval_bundle(self, bundle, radar_ori, radar_pred, radar_mu, frag1_len):
+        bundle["eval"].evaluate(radar_ori, radar_pred)
+        frag1_ori = radar_ori[:, :frag1_len]
+        frag1_pred = radar_pred[:, :frag1_len]
+        bundle["frag1_eval"].evaluate(frag1_ori, frag1_pred)
+        if radar_mu is None:
+            return
+
+        pred_res = (radar_pred - radar_mu).astype(np.float64, copy=False)
+        gt_res = (radar_ori - radar_mu).astype(np.float64, copy=False)
+        self._update_residual_stats(bundle["residual_stats"], pred_res, gt_res)
+
+        frag1_mu = radar_mu[:, :frag1_len]
+        frag1_pred_res = (frag1_pred - frag1_mu).astype(np.float64, copy=False)
+        frag1_gt_res = (frag1_ori - frag1_mu).astype(np.float64, copy=False)
+        self._update_residual_stats(bundle["frag1_residual_stats"], frag1_pred_res, frag1_gt_res)
+
+    def _print_eval_bundle(self, result_label, label, bundle):
+        res = bundle["eval"].done()
+        print_log(f"{label} {result_label} Results: {res}")
+        frag1_res = self._summarize_evaluator(bundle["frag1_eval"])
+        print_log(f"Frag1 {label} {result_label} Results: {frag1_res}")
+        finalized_residual_stats = self._finalize_residual_stats(bundle["residual_stats"])
+        finalized_frag1_residual_stats = self._finalize_residual_stats(bundle["frag1_residual_stats"])
+        if finalized_residual_stats is not None:
+            print_log(
+                f"{label} Residual Stats: "
+                f"mean(abs(pred-mu))={finalized_residual_stats['pred_abs']:.6f}, "
+                f"mean(abs(gt-mu))={finalized_residual_stats['gt_abs']:.6f}, "
+                f"abs_ratio={finalized_residual_stats['abs_ratio']:.6f}, "
+                f"std_ratio={finalized_residual_stats['std_ratio']:.6f}, "
+                f"res_mae={finalized_residual_stats['res_mae']:.6f}, "
+                f"res_corr={finalized_residual_stats['res_corr']:.6f}"
+            )
+        if finalized_frag1_residual_stats is not None:
+            print_log(
+                f"Frag1 {label} Residual Stats: "
+                f"mean(abs(pred-mu))={finalized_frag1_residual_stats['pred_abs']:.6f}, "
+                f"mean(abs(gt-mu))={finalized_frag1_residual_stats['gt_abs']:.6f}, "
+                f"abs_ratio={finalized_frag1_residual_stats['abs_ratio']:.6f}, "
+                f"std_ratio={finalized_frag1_residual_stats['std_ratio']:.6f}, "
+                f"res_mae={finalized_frag1_residual_stats['res_mae']:.6f}, "
+                f"res_corr={finalized_frag1_residual_stats['res_corr']:.6f}"
+            )
     
-    def test_samples(self, milestone, do_test=False):
+    def test_samples(self, milestone, do_test=False, split=None):
         # init test data loader
-        data_loader = self.test_loader if do_test else self.valid_loader
+        split = split or ("test" if do_test else "valid")
+        data_loader, sample_root, result_label = self._get_eval_split(split)
+        eval_scales = self._get_eval_residual_scales()
+        multi_scale_eval = self.args.use_diff and len(eval_scales) > 1
         # init sampling method
         self.model.eval()
         # init test dir config
         cnt = 0
-        save_dir = osp.join(self.test_path, f"sample-{milestone}") if do_test else osp.join(self.valid_path, f"sample-{milestone}")
+        save_dir = osp.join(sample_root, f"sample-{milestone}")
         os.makedirs(save_dir, exist_ok=True)
         if self.is_main:
-            eval = Evaluator(
-                seq_len=self.args.frames_out,
-                value_scale=self.scale_value,
-                thresholds=self.thresholds,
-                save_path=save_dir,
-            )
+            print_log(f"Eval split: {split}", self.is_main)
+            if self.args.use_diff:
+                print_log(
+                    f"Eval conditioning mode: {self.args.eval_conditioning_mode}; residual_scale: {self.args.residual_scale}",
+                    self.is_main,
+                )
+                if multi_scale_eval:
+                    print_log(f"Eval residual scales in one pass: {eval_scales}", self.is_main)
+            if self.args.eval_max_batches is not None:
+                print_log(f"Eval max batches: {self.args.eval_max_batches}", self.is_main)
+            if self.args.skip_eval_image_save:
+                print_log("Eval image saving disabled", self.is_main)
+
+            frag1_len = min(self.args.frames_in, self.args.frames_out)
+            if multi_scale_eval:
+                scale_bundles = {
+                    scale: self._make_eval_bundle(self.args.frames_out, save_dir)
+                    for scale in eval_scales
+                }
+                eval = None
+                frag1_eval = None
+                residual_stats = None
+                frag1_residual_stats = None
+            else:
+                eval = Evaluator(
+                    seq_len=self.args.frames_out,
+                    value_scale=self.scale_value,
+                    thresholds=self.thresholds,
+                    save_path=save_dir,
+                )
+                frag1_eval = Evaluator(
+                    seq_len=frag1_len,
+                    value_scale=self.scale_value,
+                    thresholds=self.thresholds,
+                    save_path=save_dir,
+                )
+                residual_stats = self._make_residual_stats_accumulator() if self.args.use_diff else None
+                frag1_residual_stats = self._make_residual_stats_accumulator() if self.args.use_diff else None
+
             mu_eval = Evaluator(
                 seq_len=self.args.frames_out,
                 value_scale=self.scale_value,
                 thresholds=self.thresholds,
                 save_path=save_dir,
             ) if self.args.use_diff else None
-            pred_mu_abs_sum = 0.0
-            gt_mu_abs_sum = 0.0
-            res_mae_sum = 0.0
-            pred_res_sum = 0.0
-            gt_res_sum = 0.0
-            pred_res_sq_sum = 0.0
-            gt_res_sq_sum = 0.0
-            res_cross_sum = 0.0
-            residual_count = 0
+            frag1_mu_eval = Evaluator(
+                seq_len=frag1_len,
+                value_scale=self.scale_value,
+                thresholds=self.thresholds,
+                save_path=save_dir,
+            ) if self.args.use_diff else None
         # start test loop
-        for batch in tqdm(data_loader,desc='Test Samples', disable=not self.is_main):
+        for batch_idx, batch in enumerate(tqdm(data_loader,desc=f'{result_label} Samples', disable=not self.is_main)):
+            if self.args.eval_max_batches is not None and batch_idx >= self.args.eval_max_batches:
+                break
             # sample
-            radar_ori, radar_recon, radar_mu = self._sample_batch(
+            sample_output = self._sample_batch(
                 batch,
                 use_ema=True,
                 return_mu=self.args.use_diff,
+                return_residual=multi_scale_eval,
             )
-            # evaluate result and save
-            eval.evaluate(radar_ori, radar_recon)
-            if self.is_main and mu_eval is not None and radar_mu is not None:
-                mu_eval.evaluate(radar_ori, radar_mu)
-                pred_res = (radar_recon - radar_mu).astype(np.float64, copy=False)
-                gt_res = (radar_ori - radar_mu).astype(np.float64, copy=False)
-                pred_mu_abs_sum += float(np.abs(pred_res).sum())
-                gt_mu_abs_sum += float(np.abs(gt_res).sum())
-                res_mae_sum += float(np.abs(pred_res - gt_res).sum())
-                pred_res_sum += float(pred_res.sum())
-                gt_res_sum += float(gt_res.sum())
-                pred_res_sq_sum += float(np.square(pred_res).sum())
-                gt_res_sq_sum += float(np.square(gt_res).sum())
-                res_cross_sum += float((pred_res * gt_res).sum())
-                residual_count += pred_res.size
+            if multi_scale_eval:
+                radar_ori, radar_recon, radar_mu, radar_residual = sample_output
+            else:
+                radar_ori, radar_recon, radar_mu = sample_output
+                radar_residual = None
+
             if self.is_main:
-                for i in range(radar_ori.shape[0]):
-                    self.visiual_save_fn(radar_recon[i], radar_ori[i], osp.join(save_dir, f"{cnt}-{i}/vil"),data_type='vil')
+                frag1_ori = radar_ori[:, :frag1_len]
+
+                if multi_scale_eval:
+                    if radar_mu is None or radar_residual is None:
+                        raise ValueError("Multi-scale residual eval requires diffusion mu and residual outputs")
+                    for scale, bundle in scale_bundles.items():
+                        scaled_recon = np.clip(radar_mu + scale * radar_residual, 0.0, 1.0)
+                        self._update_eval_bundle(bundle, radar_ori, scaled_recon, radar_mu, frag1_len)
+                    radar_recon_to_save = np.clip(
+                        radar_mu + eval_scales[0] * radar_residual,
+                        0.0,
+                        1.0,
+                    )
+                else:
+                    # evaluate result and save
+                    eval.evaluate(radar_ori, radar_recon)
+                    frag1_recon = radar_recon[:, :frag1_len]
+                    frag1_eval.evaluate(frag1_ori, frag1_recon)
+                    radar_recon_to_save = radar_recon
+                    if radar_mu is not None:
+                        pred_res = (radar_recon - radar_mu).astype(np.float64, copy=False)
+                        gt_res = (radar_ori - radar_mu).astype(np.float64, copy=False)
+                        self._update_residual_stats(residual_stats, pred_res, gt_res)
+                        frag1_mu_for_stats = radar_mu[:, :frag1_len]
+                        frag1_pred_res = (frag1_recon - frag1_mu_for_stats).astype(np.float64, copy=False)
+                        frag1_gt_res = (frag1_ori - frag1_mu_for_stats).astype(np.float64, copy=False)
+                        self._update_residual_stats(frag1_residual_stats, frag1_pred_res, frag1_gt_res)
+
+                if mu_eval is not None and radar_mu is not None:
+                    mu_eval.evaluate(radar_ori, radar_mu)
+                    frag1_mu = radar_mu[:, :frag1_len]
+                    frag1_mu_eval.evaluate(frag1_ori, frag1_mu)
+                if not self.args.skip_eval_image_save:
+                    for i in range(radar_ori.shape[0]):
+                        self.visiual_save_fn(
+                            radar_recon_to_save[i],
+                            radar_ori[i],
+                            osp.join(save_dir, f"{cnt}-{i}/vil"),
+                            data_type='vil',
+                        )
 
             self.accelerator.wait_for_everyone()
-            # cnt += 1
+            cnt += 1
             # if cnt > 10:
             #     break
         # test done
         if self.is_main:
-            res = eval.done()
-            print_log(f"Test Results: {res}")
+            if multi_scale_eval:
+                print_log("========== Multi Residual Scale Results ==========")
+                for scale, bundle in scale_bundles.items():
+                    self._print_eval_bundle(result_label, f"scale={scale:g}", bundle)
+            else:
+                res = eval.done()
+                print_log(f"{result_label} Results: {res}")
+                frag1_res = self._summarize_evaluator(frag1_eval)
+                print_log("========== First Fragment Diagnostics ==========")
+                print_log(f"Frag1 {result_label} Results: {frag1_res}")
             if mu_eval is not None:
                 print_log("========== Backbone Mu Results ==========")
                 mu_res = mu_eval.done()
-                print_log(f"Mu Test Results: {mu_res}")
-                if residual_count > 0:
-                    pred_mu_abs = pred_mu_abs_sum / residual_count
-                    gt_mu_abs = gt_mu_abs_sum / residual_count
-                    res_mae = res_mae_sum / residual_count
-                    pred_res_mean = pred_res_sum / residual_count
-                    gt_res_mean = gt_res_sum / residual_count
-                    pred_res_var = max(pred_res_sq_sum / residual_count - pred_res_mean ** 2, 0.0)
-                    gt_res_var = max(gt_res_sq_sum / residual_count - gt_res_mean ** 2, 0.0)
-                    pred_res_std = pred_res_var ** 0.5
-                    gt_res_std = gt_res_var ** 0.5
-                    res_cov = res_cross_sum / residual_count - pred_res_mean * gt_res_mean
-                    abs_ratio = pred_mu_abs / max(gt_mu_abs, 1e-8)
-                    std_ratio = pred_res_std / max(gt_res_std, 1e-8)
-                    res_corr = res_cov / max(pred_res_std * gt_res_std, 1e-8)
+                print_log(f"Mu {result_label} Results: {mu_res}")
+                frag1_mu_res = self._summarize_evaluator(frag1_mu_eval)
+                print_log(f"Frag1 Mu {result_label} Results: {frag1_mu_res}")
+                if multi_scale_eval:
+                    for scale, bundle in scale_bundles.items():
+                        frag1_res = self._summarize_evaluator(bundle["frag1_eval"])
+                        print_log(
+                            f"scale={scale:g} Frag1 Delta vs Mu: "
+                            f"csi={frag1_res['csi'] - frag1_mu_res['csi']:.6f}, "
+                            f"far={frag1_res['far'] - frag1_mu_res['far']:.6f}, "
+                            f"pod={frag1_res['pod'] - frag1_mu_res['pod']:.6f}, "
+                            f"hss={frag1_res['hss'] - frag1_mu_res['hss']:.6f}"
+                        )
+                else:
                     print_log(
-                        "Residual Stats: "
-                        f"mean(abs(pred-mu))={pred_mu_abs:.6f}, "
-                        f"mean(abs(gt-mu))={gt_mu_abs:.6f}, "
-                        f"abs_ratio={abs_ratio:.6f}, "
-                        f"std_ratio={std_ratio:.6f}, "
-                        f"res_mae={res_mae:.6f}, "
-                        f"res_corr={res_corr:.6f}"
+                        "Frag1 Delta vs Mu: "
+                        f"csi={frag1_res['csi'] - frag1_mu_res['csi']:.6f}, "
+                        f"far={frag1_res['far'] - frag1_mu_res['far']:.6f}, "
+                        f"pod={frag1_res['pod'] - frag1_mu_res['pod']:.6f}, "
+                        f"hss={frag1_res['hss'] - frag1_mu_res['hss']:.6f}"
                     )
+                    finalized_residual_stats = self._finalize_residual_stats(residual_stats)
+                    finalized_frag1_residual_stats = self._finalize_residual_stats(frag1_residual_stats)
+                    if finalized_residual_stats is not None:
+                        print_log(
+                            "Residual Stats: "
+                            f"mean(abs(pred-mu))={finalized_residual_stats['pred_abs']:.6f}, "
+                            f"mean(abs(gt-mu))={finalized_residual_stats['gt_abs']:.6f}, "
+                            f"abs_ratio={finalized_residual_stats['abs_ratio']:.6f}, "
+                            f"std_ratio={finalized_residual_stats['std_ratio']:.6f}, "
+                            f"res_mae={finalized_residual_stats['res_mae']:.6f}, "
+                            f"res_corr={finalized_residual_stats['res_corr']:.6f}"
+                        )
+                    if finalized_frag1_residual_stats is not None:
+                        print_log(
+                            "Frag1 Residual Stats: "
+                            f"mean(abs(pred-mu))={finalized_frag1_residual_stats['pred_abs']:.6f}, "
+                            f"mean(abs(gt-mu))={finalized_frag1_residual_stats['gt_abs']:.6f}, "
+                            f"abs_ratio={finalized_frag1_residual_stats['abs_ratio']:.6f}, "
+                            f"std_ratio={finalized_frag1_residual_stats['std_ratio']:.6f}, "
+                            f"res_mae={finalized_frag1_residual_stats['res_mae']:.6f}, "
+                            f"res_corr={finalized_frag1_residual_stats['res_corr']:.6f}"
+                        )
             print_log("="*30)
 
         
-    def check_milestones(self, target_ckpt=None):
+    def check_milestones(self, target_ckpt=None, eval_split=None):
+        eval_split = eval_split or self.args.eval_split
 
         mils_paths = os.listdir(self.ckpt_path)
-        milestones = sorted([int(m.split('-')[-1].split('.')[0]) for m in mils_paths], reverse=True)
+        milestones = []
+        for name in mils_paths:
+            match = re.fullmatch(r"ckpt-(\d+)\.pt", name)
+            if match is not None:
+                milestones.append(int(match.group(1)))
+        milestones = sorted(milestones, reverse=True)
         print_log(f"milestones: {milestones}", self.accelerator.is_main_process)
         
         if target_ckpt is not None:
             self.load(target_ckpt)
-            saved_dir_name = target_ckpt.split('/')[-1].split('.')[0]
-            self.test_samples(saved_dir_name, do_test=True)
+            saved_dir_name = osp.splitext(osp.basename(str(target_ckpt)))[0]
+            self.test_samples(saved_dir_name, split=eval_split)
             return
         
         for m in range(0, len(milestones), 1):
             self.load(milestones[m])
-            self.test_samples(milestones[m], do_test=True)
+            self.test_samples(milestones[m], split=eval_split)
             
 def main():
     args = create_parser()
     exp = Runner(args)
     if not args.eval:
         exp.train()
+        # Preserve the old auto-eval behavior only for fresh runs.
+        if args.ckpt_milestone is None:
+            exp.check_milestones(target_ckpt=args.ckpt_milestone)
+        return
 
     exp.check_milestones(target_ckpt=args.ckpt_milestone)
     

@@ -1,0 +1,48 @@
+03/08/2026 15:29:37 - WARNING - py.warnings - /gpfs/home4/kgwiazda/DiffCast/.venv/lib64/python3.9/site-packages/accelerate/accelerator.py:530: UserWarning: `log_with=wandb` was passed but no supported trackers are currently installed.
+  warnings.warn(f"`log_with={log_with}` was passed but no supported trackers are currently installed.")
+
+03/08/2026 15:29:37 - INFO - root - ============================================================
+03/08/2026 15:29:37 - INFO - root -                  Experiment Start                           
+03/08/2026 15:29:37 - INFO - root - ============================================================
+03/08/2026 15:29:37 - INFO - root - Distributed environment: NO
+Num processes: 1
+Process index: 0
+Local process index: 0
+Device: cuda
+
+Mixed precision type: fp16
+
+03/08/2026 15:29:50 - WARNING - py.warnings - /gpfs/home4/kgwiazda/DiffCast/datasets/dataset_sevir.py:353: FutureWarning: DataFrameGroupBy.apply operated on the grouping columns. This behavior is deprecated, and in a future version of pandas the grouping columns will be excluded from the operation. Either pass `include_groups=False` to exclude the groupings or explicitly select the grouping columns after groupby to silence this warning.
+  self._samples = filtcat.groupby('id').apply(lambda df: self._df_to_series(df,imgt) )
+
+03/08/2026 15:29:54 - WARNING - py.warnings - /gpfs/home4/kgwiazda/DiffCast/datasets/dataset_sevir.py:353: FutureWarning: DataFrameGroupBy.apply operated on the grouping columns. This behavior is deprecated, and in a future version of pandas the grouping columns will be excluded from the operation. Either pass `include_groups=False` to exclude the groupings or explicitly select the grouping columns after groupby to silence this warning.
+  self._samples = filtcat.groupby('id').apply(lambda df: self._df_to_series(df,imgt) )
+
+03/08/2026 15:29:55 - WARNING - py.warnings - /gpfs/home4/kgwiazda/DiffCast/datasets/dataset_sevir.py:353: FutureWarning: DataFrameGroupBy.apply operated on the grouping columns. This behavior is deprecated, and in a future version of pandas the grouping columns will be excluded from the operation. Either pass `include_groups=False` to exclude the groupings or explicitly select the grouping columns after groupby to silence this warning.
+  self._samples = filtcat.groupby('id').apply(lambda df: self._df_to_series(df,imgt) )
+
+03/08/2026 15:29:55 - INFO - root - train data: 14882, valid data: 3518, test_data: 902
+03/08/2026 15:29:55 - INFO - root - Pixel Scale: 255.0, Threshold: (16, 74, 133, 160, 181, 219)
+03/08/2026 15:29:56 - INFO - root - Main Model Parameters: 50.30M
+03/08/2026 15:29:56 - INFO - root - ============ Running training ============
+03/08/2026 15:29:56 - INFO - root -     Num examples = 14882
+03/08/2026 15:29:56 - INFO - root -     Num Epochs = 20
+03/08/2026 15:29:56 - INFO - root -     Instantaneous batch size per GPU = 4
+03/08/2026 15:29:56 - INFO - root -     Total train batch size (w. parallel, distributed & accumulation) = 4
+03/08/2026 15:29:56 - INFO - root -     Total optimization steps = 297640
+03/08/2026 15:29:56 - INFO - root - optimizer: AdamW (
+Parameter Group 0
+    amsgrad: False
+    betas: (0.9, 0.95)
+    capturable: False
+    differentiable: False
+    eps: 1e-08
+    foreach: None
+    fused: None
+    initial_lr: 0.0001
+    lr: 0.0
+    maximize: False
+    weight_decay: 0.0
+) with init lr: 0.0001
+03/08/2026 15:29:56 - INFO - root - Data Loading Time: 0.2737302780151367
+03/08/2026 15:29:56 - INFO - root - gpu_nums: 1, gpu_id: 0

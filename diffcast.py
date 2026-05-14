@@ -766,6 +766,10 @@ class GaussianDiffusion(nn.Module):
     def load_backbone(self, backbone_net):
         self.backbone_net = backbone_net
 
+    def _backbone_uses_teacher_forced_rollout(self):
+        core = getattr(self.backbone_net, 'core', None)
+        return core is not None and hasattr(core, 'teacher_forcing_ratio')
+
     def predict_start_from_noise(self, x_t, t, noise):
         return (
             extract(self.sqrt_recip_alphas_cumprod, t, x_t.shape) * x_t -
@@ -956,11 +960,25 @@ class GaussianDiffusion(nn.Module):
         )
 
     @torch.no_grad()
-    def sample(self, frames_in, T_out, return_all_timesteps = False):
+    def sample(
+        self,
+        frames_in,
+        T_out,
+        return_all_timesteps = False,
+        frames_gt = None,
+        conditioning_mode = "autoregressive",
+        residual_scale = 1.0,
+    ):
         B, T_in, c, h, w = frames_in.shape
         device = self.device
+        if conditioning_mode not in {"autoregressive", "oracle_gt"}:
+            raise ValueError(f"Unknown conditioning_mode: {conditioning_mode}")
+        if conditioning_mode == "oracle_gt" and frames_gt is None:
+            raise ValueError("frames_gt is required when conditioning_mode='oracle_gt'")
         backbone_output, _ = self.backbone_net.predict(frames_in)
         frames_in = self.normalize(frames_in)
+        if frames_gt is not None:
+            frames_gt = self.normalize(frames_gt)
         backbone_output = self.normalize(backbone_output)
 
         global_ctx, local_ctx = self.ctx_net.scan_ctx(torch.cat((frames_in, backbone_output), dim=1))
@@ -989,24 +1007,27 @@ class GaussianDiffusion(nn.Module):
                 return_all_timesteps = return_all_timesteps
                 )
 
-            frag_pred = y + mu
+            frag_pred = residual_scale * y + mu
             
             frames_pred.append(
                 frag_pred  # if frag_idx > 0 else mu
                 )
             ys.append(y)
             
-            pre_frag = frag_pred
+            if conditioning_mode == "oracle_gt":
+                pre_frag = frames_gt[:, frag_idx * T_in : (frag_idx + 1) * T_in]
+            else:
+                pre_frag = frag_pred
             pre_mu = mu
         
         frames_pred = self.unnormalize(torch.cat(frames_pred, dim=1))
         frames_pred = frames_pred.clamp(0,1)
-        # ys = self.unnormalize(torch.cat(ys, dim=1))
         ys = torch.cat(ys, dim=1)
+        ys_data_scale = self.unnormalize(ys) - self.unnormalize(torch.zeros_like(ys))
         
         # print(ys.max(), ys.min(),ys.shape)
         backbone_output = self.unnormalize(backbone_output)
-        return frames_pred, backbone_output, ys
+        return frames_pred, backbone_output, ys_data_scale
 
     def train_loss(
         self,
@@ -1025,6 +1046,10 @@ class GaussianDiffusion(nn.Module):
         backbone_output, det_loss = self.backbone_net.predict(
             frames_in, frames_gt=frames_gt, compute_loss=True
         )
+        if self._backbone_uses_teacher_forced_rollout():
+            backbone_output, _ = self.backbone_net.predict(
+                frames_in, compute_loss=False
+            )
         frames_in = self.normalize(frames_in)
         frames_gt = self.normalize(frames_gt)
         backbone_output = self.normalize(backbone_output)
@@ -1066,13 +1091,14 @@ class GaussianDiffusion(nn.Module):
             pred_res_stds.append(pred_residual.std(unbiased=False))
 
             if frag_idx < (T_out // T_in) - 1:
-                sampled_residual = self.sample_residual_for_training(
-                    residual.shape,
+                sampled_prev_residual = self.sample_residual_for_training(
+                    (B, T_in, c, h, w),
                     cond=cond,
                     ctx=ctx,
                     idx=idx,
                 )
-                pre_frag = (mu + sampled_residual).detach()
+                sampled_prev_frag = sampled_prev_residual + mu
+                pre_frag = sampled_prev_frag.detach()
                 pre_mu = mu
 
         diff_loss = torch.stack(losses).mean()
